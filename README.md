@@ -120,6 +120,18 @@ the steps below for native installs.
 
 ## 3b. Native install — Debian / Ubuntu
 
+> Verified against a real Cloudflare Gateway DoT hostname on Ubuntu
+> 22.04: `systemctl status stubby` confirmed "Strict Profile
+> (Authentication required)" with TLS as the only configured
+> transport, `dig`/`curl` resolved successfully through
+> `127.0.0.1#53`, and a packet capture during live queries showed
+> every off-host packet on port 853 — the only port-53 traffic seen
+> anywhere was `dig`'s local loopback hop to `stubby` itself, which
+> never reaches the network. Pointing `stubby` at a server that fails
+> TLS validation returned `SERVFAIL` rather than silently falling back
+> to plaintext, confirming the "TLS is the ONLY transport" guarantee
+> stubby logs on startup.
+
 ```
 sudo apt update
 sudo apt install -y stubby dnsutils curl

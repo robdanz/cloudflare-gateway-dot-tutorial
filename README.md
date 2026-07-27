@@ -189,6 +189,15 @@ Skip to [Step 4: Verify](#4-verify-its-working).
 
 ## 3c. Native install — RHEL / Fedora
 
+> Verified against a real Cloudflare Gateway DoT hostname on Fedora 40
+> (systemd 255): same result as the Debian/Ubuntu track — `stubby`
+> logged "Strict Profile (Authentication required)" with TLS as the
+> only transport, `dig`/`curl` resolved through `127.0.0.1#53`, a
+> packet capture during live queries showed every off-host packet on
+> port 853 with zero plaintext DNS reaching the network, and pointing
+> `stubby` at a server that fails TLS validation returned `SERVFAIL`
+> instead of falling back.
+
 On RHEL/CentOS, enable EPEL first (Fedora already has `stubby` in its
 official repos):
 
@@ -357,6 +366,15 @@ hostname should resolve fine.
 - **Policy doesn't seem to be enforced** — confirm the DNS policy from
   step 2 is deployed and, if scoped with a `Location` selector, that it's
   scoped to the same DNS location whose DoT hostname you're using.
+- **(RHEL/Fedora) `systemctl start stubby` hangs / stays "waiting"** —
+  Fedora's `stubby.service` unit orders itself after
+  `network-online.target`. If NetworkManager hasn't marked a connection
+  "online" yet (flaky DHCP, a just-completed boot, or a non-NM-managed
+  interface), that target — and `stubby` behind it — can sit waiting
+  indefinitely. Check `systemctl list-jobs` and `nmcli device status`;
+  if the interface is stuck un-online, resolving that (or as a last
+  resort `sudo systemctl stop NetworkManager-wait-online.service`) will
+  unblock the queued `stubby` start.
 - **(systemd-resolved path) `resolvectl status` doesn't show
   `+DNSOverTLS`** — check `journalctl -u systemd-resolved` for TLS
   handshake errors, confirm `DNSOverTLS=yes` (not `opportunistic`) is

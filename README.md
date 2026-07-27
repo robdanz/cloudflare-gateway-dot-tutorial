@@ -218,6 +218,14 @@ sudo systemctl restart stubby
 
 ## 3d. Native install — systemd-resolved only (no `stubby`)
 
+> Verified against a real Cloudflare Gateway DoT hostname on Ubuntu 22.04
+> (systemd 249): `resolvectl status` showed `+DNSOverTLS` active, a
+> packet capture during a live query showed every packet on port 853
+> to the Gateway IP and zero on port 53, and deliberately pointing
+> `DNS=` at a server that fails TLS certificate validation caused
+> `resolvectl query` to fail outright rather than silently falling back
+> to plaintext.
+
 If you can't install `stubby` at all, systemd-resolved (systemd v243+,
 default on most modern Ubuntu/Debian and Fedora Workstation installs)
 speaks DoT natively. You reconfigure the resolver that's already running
@@ -272,10 +280,13 @@ sudo systemctl restart systemd-resolved
 won't show `127.0.0.1` here, it'll still show the systemd-resolved stub):
 
 ```
-resolvectl status                 # look for your IP under "Current DNS Server"
-                                   # and a "+DNSOverTLS" flag
+resolvectl status                 # look for your IP#hostname under "DNS Servers"
+                                   # and a "+DNSOverTLS" flag under Protocols
 
-resolvectl query example.com      # resolves through the DoT path
+resolvectl query example.com      # resolves through the DoT path — check the
+                                   # last line of output: "Data was acquired
+                                   # via local or encrypted transport: yes"
+                                   # confirms it went out over DoT, not plaintext
 
 dig example.com                   # goes through the systemd-resolved stub,
                                    # which forwards it over DoT
@@ -286,11 +297,13 @@ Then test a domain covered by the block policy from step 2 the same way
 
 > **Tradeoff vs. `stubby`:** `stubby` is configured with TLS as its
 > *only* transport — there is no non-TLS path for it to fall back to,
-> even accidentally. systemd-resolved's retry/fallback logic isn't quite
-> as rigorously all-or-nothing, so this path is a slightly weaker
-> enforcement guarantee. Fine for testing Gateway policy behavior; if
-> you need an airtight guarantee that zero plaintext DNS is possible,
-> prefer `stubby`.
+> even accidentally, by construction. systemd-resolved's `DNSOverTLS=yes`
+> is also strict in practice (verified above — it fails the query rather
+> than falling back when TLS validation fails), but it's one runtime
+> setting on a resolver that supports plaintext too, rather than a
+> transport that was never compiled/configured in. If you need the
+> stronger structural guarantee, prefer `stubby`; if `DNSOverTLS=yes`
+> behaving correctly is good enough for your test, this path works.
 
 ## 4. Verify it's working (Docker / native `stubby` paths)
 

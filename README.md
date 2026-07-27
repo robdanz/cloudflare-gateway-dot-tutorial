@@ -24,24 +24,50 @@ A few ways to follow along:
   it. Slightly weaker enforcement guarantee than `stubby` (see the note
   in that section), but workable.
 
-## How this works
+## How this works: bootstrapping the DoT endpoint
 
-A DoT hostname like `abc123.cloudflare-gateway.com` can't be reached over
-TLS until something resolves it to an IP — and that resolution can't
-happen over DoT itself, since DoT is what we're setting up. So there's
-one, and only one, plain DNS query involved anywhere in this setup: a
-one-time **bootstrap lookup** (over plain UDP/53, against a resolver like
-`8.8.8.8`) that resolves the DoT hostname to an IP.
+A DoT hostname like `abc123.cloudflare-gateway.com` is just a hostname —
+before anything can open a TLS connection to it, something has to
+resolve it to an IP address first. That resolution can't happen over DoT
+itself, since DoT is the thing being set up; you'd need a working DoT
+connection to resolve the name of the DoT server, which is circular. So
+every path in this tutorial (Docker and all three native installs) does
+exactly **one** plain DNS query, exactly once, before DoT exists at all:
+the **bootstrap lookup**.
 
-That IP — plus the hostname itself — gets fed into `stubby`'s config as
-its **only** upstream, using TLS as its **only** transport, with
-`tls_auth_name` set to the hostname so `stubby` validates the upstream's
-TLS certificate against it (not just trusting whatever answers on that
-IP). `stubby` then listens locally on `127.0.0.1:53`. Once the system's
-resolver config points there instead of anywhere else, every subsequent
-DNS lookup a tool makes — `dig`, `curl`, anything using the standard
-resolver — goes exclusively through `stubby` and, from there, exclusively
-over encrypted DoT to Cloudflare Gateway.
+Concretely, that's a single `dig` against an ordinary plain-DNS resolver
+(`8.8.8.8` by default in this repo — any working resolver works):
+
+```
+dig +short @8.8.8.8 A your-location-id.cloudflare-gateway.com
+# → 162.159.36.5   (an example IP — yours will differ, and Gateway may
+#                    return more than one)
+```
+
+That's the only UDP/53 query this setup is designed to make, anywhere,
+ever. Everything downstream depends on its result:
+
+1. **The resolved IP** becomes the sole upstream address the DoT
+   resolver (`stubby` or systemd-resolved) is configured to talk to.
+2. **The hostname itself** — not the IP — gets pinned as the identity
+   the upstream's TLS certificate must match (`tls_auth_name` in
+   `stubby`, the `#hostname` suffix in systemd-resolved's `DNS=`). This
+   is what stops the setup from just trusting whatever happens to answer
+   on that IP.
+3. **TLS is configured as the only transport** the resolver will use for
+   that upstream (`stubby`'s `dns_transport_list: [GETDNS_TRANSPORT_TLS]`,
+   systemd-resolved's `DNSOverTLS=yes`).
+4. The resolver then listens locally (`127.0.0.1:53` for `stubby`; the
+   existing systemd-resolved stub for that path), and the system's
+   resolver config is pointed at it. From that moment on, every
+   subsequent DNS lookup any tool makes — `dig`, `curl`, anything using
+   the standard resolver — goes exclusively through that local resolver
+   and, from there, exclusively over encrypted DoT to Cloudflare Gateway.
+
+Because the bootstrap IP is captured once and hardcoded into the config,
+if Gateway's DoT endpoint IP changes later, the DoT connection will start
+failing and needs a fresh bootstrap lookup + restart to pick up the new
+IP (see [Notes / limitations](#notes--limitations)).
 
 ## 1. Create a DoT-enabled DNS location in Cloudflare Gateway
 
@@ -107,7 +133,7 @@ Or copy `.env.example` to `.env`, fill in `DOT_HOSTNAME`, and just run
 `docker compose run --rm dot-test`.
 
 You'll land in a shell where `dig`/`curl` already go through DoT — skip
-to [Step 4: Verify](#4-verify-its-working).
+to [Step 4: Verify](#4-verify-its-working-docker--native-stubby-paths).
 
 Config knobs (env vars): `DOT_HOSTNAME` (required), `DOT_PORT` (default
 `853`), `BOOTSTRAP_RESOLVER` (default `8.8.8.8`, used only for the
@@ -138,7 +164,8 @@ sudo apt install -y stubby dnsutils curl
 ```
 
 **Bootstrap-resolve your DoT hostname** (replace with the hostname from
-step 1):
+step 1) — this is the one-time plain DNS query explained in
+[How this works](#how-this-works-bootstrapping-the-dot-endpoint) above:
 
 ```
 dig +short @8.8.8.8 A your-location-id.cloudflare-gateway.com
@@ -185,7 +212,9 @@ sudo systemctl enable --now stubby
 sudo systemctl restart stubby
 ```
 
-Skip to [Step 4: Verify](#4-verify-its-working).
+Skip to [Step 4: Verify](#4-verify-its-working-docker--native-stubby-paths). (Want failover to
+`8.8.8.8` if Gateway becomes unreachable? See
+[Step 5: Optional fallback](#5-optional-fail-over-to-8888-if-gateway-becomes-unreachable).)
 
 ## 3c. Native install — RHEL / Fedora
 
@@ -206,7 +235,9 @@ sudo dnf install -y epel-release   # RHEL/CentOS only, skip on Fedora
 sudo dnf install -y stubby bind-utils curl
 ```
 
-**Bootstrap-resolve your DoT hostname:**
+**Bootstrap-resolve your DoT hostname** — the one-time plain DNS query
+explained in [How this works](#how-this-works-bootstrapping-the-dot-endpoint)
+above:
 
 ```
 dig +short @8.8.8.8 A your-location-id.cloudflare-gateway.com
@@ -237,6 +268,10 @@ sudo systemctl enable --now stubby
 sudo systemctl restart stubby
 ```
 
+Skip to [Step 4: Verify](#4-verify-its-working-docker--native-stubby-paths).
+(Want failover to `8.8.8.8` if Gateway becomes unreachable? See
+[Step 5: Optional fallback](#5-optional-fail-over-to-8888-if-gateway-becomes-unreachable).)
+
 ## 3d. Native install — systemd-resolved only (no `stubby`)
 
 > Verified against a real Cloudflare Gateway DoT hostname on Ubuntu 22.04
@@ -261,7 +296,8 @@ systemctl --version   # want 243 or newer
 ```
 
 **Bootstrap-resolve your DoT hostname** (replace with the hostname from
-step 1):
+step 1) — the one-time plain DNS query explained in
+[How this works](#how-this-works-bootstrapping-the-dot-endpoint) above:
 
 ```
 dig +short @8.8.8.8 A your-location-id.cloudflare-gateway.com
@@ -314,7 +350,9 @@ dig example.com                   # goes through the systemd-resolved stub,
 ```
 
 Then test a domain covered by the block policy from step 2 the same way
-— via `resolvectl query` or `dig`.
+— via `resolvectl query` or `dig`. (Want failover to `8.8.8.8` if Gateway
+becomes unreachable? See
+[Step 5: Optional fallback](#5-optional-fail-over-to-8888-if-gateway-becomes-unreachable).)
 
 > **Tradeoff vs. `stubby`:** `stubby` is configured with TLS as its
 > *only* transport — there is no non-TLS path for it to fall back to,
@@ -347,6 +385,85 @@ hostname that falls under the block policy you created in step 2 —
 you should see it fail to resolve, get an `NXDOMAIN`, or come back
 sinkholed, depending on how the policy is configured. A normal, unrelated
 hostname should resolve fine.
+
+## 5. Optional: fail over to 8.8.8.8 if Gateway becomes unreachable
+
+Both `stubby` and systemd-resolved can be given a second, fallback
+server. Read this before you reach for it, though — it doesn't do what
+the name "UDP/53 fallback" might suggest.
+
+> **What actually happens (verified by testing):** `8.8.8.8` itself
+> speaks DNS-over-TLS. Both `stubby` and systemd-resolved always prefer
+> TLS to any server that offers it, so when failover to `8.8.8.8`
+> kicks in, it happens over **encrypted DoT (port 853)**, not plaintext
+> UDP/53. I confirmed this with a packet capture during a live failover
+> in both tools, and confirmed the mechanism itself by blocking
+> `8.8.8.8`'s DoT port with `iptables` — even then, neither tool
+> reliably dropped to plain UDP against `8.8.8.8` within a normal query
+> timeout. Forcing genuine plaintext UDP would mean disabling TLS
+> preference for the whole resolver, which also strips DoT from your
+> Gateway queries — defeating the point of this whole setup. So: this
+> section gives you **encrypted failover to a second resolver**, not a
+> plaintext escape hatch.
+
+### `stubby`
+
+Add a second `upstream_recursive_servers` entry for `8.8.8.8` with no
+`tls_auth_name`/`tls_port` (so `stubby` doesn't try to pin its
+certificate to anything), and set `round_robin_upstreams: 0` so Gateway
+is always tried first, in order — `8.8.8.8` is only touched once Gateway
+is judged unreachable:
+
+```
+resolution_type: GETDNS_RESOLUTION_STUB
+dns_transport_list:
+  - GETDNS_TRANSPORT_TLS
+  - GETDNS_TRANSPORT_UDP
+tls_authentication: GETDNS_AUTHENTICATION_REQUIRED
+tls_query_padding_blocksize: 128
+idle_timeout: 10000
+listen_addresses:
+  - 127.0.0.1@53
+round_robin_upstreams: 0
+upstream_recursive_servers:
+  - address_data: PASTE_BOOTSTRAP_IP_HERE
+    tls_auth_name: "your-location-id.cloudflare-gateway.com"
+    tls_port: 853
+  - address_data: 8.8.8.8
+```
+
+`GETDNS_TRANSPORT_UDP` is kept in the list as a last-resort transport in
+case `8.8.8.8` ever stops answering DoT, but don't count on it firing —
+in testing, failover consistently landed on DoT to `8.8.8.8`, and total
+failover time was several seconds (`stubby` retries the primary a few
+times first). If Gateway is unreachable in a way that times out silently
+rather than actively refusing the connection, `stubby` can also exhaust
+its own retry budget and return `SERVFAIL` before ever reaching the
+fallback — treat this as best-effort resilience, not guaranteed
+sub-second failover.
+
+### systemd-resolved
+
+List both servers on the `DNS=` line, Gateway first, and leave
+`DNSOverTLS=yes` in place:
+
+```
+[Resolve]
+DNS=PASTE_BOOTSTRAP_IP_HERE#your-location-id.cloudflare-gateway.com 8.8.8.8
+DNSOverTLS=yes
+Domains=~.
+```
+
+Same result as `stubby`: once Gateway is judged unreachable (roughly
+10 seconds in testing), systemd-resolved fails over to `8.8.8.8` — over
+DoT, since `DNSOverTLS=yes` applies to every configured server, not just
+the first one.
+
+> Don't reach for `FallbackDNS=` here — it's tempting because of the
+> name, but it does nothing in this setup. Verified by testing:
+> `FallbackDNS=` servers are only ever used when **no** `DNS=` servers
+> are configured at all. Since this tutorial always sets `DNS=`
+> explicitly, a `FallbackDNS=8.8.8.8` line is silently ignored.
 
 ## Troubleshooting
 

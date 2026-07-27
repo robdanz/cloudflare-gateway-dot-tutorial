@@ -9,14 +9,20 @@ block specific domains, etc.) apply to that traffic. It's the fastest way
 to prove out Gateway DNS policy behavior from a shell, without touching a
 device's full WARP/Cloudflare One Client configuration.
 
-Two ways to follow along:
+A few ways to follow along:
 
 - **Docker** — one command, works identically on macOS/Linux/Windows,
   no changes to your host's DNS config. Good default.
-- **Native install** — installs `stubby` directly on Debian/Ubuntu or
-  RHEL/Fedora and points the whole host at it. Useful when you want to
-  test how a real endpoint (not a container) behaves under a Gateway DoT
-  policy, or when Docker isn't available.
+- **Native install with `stubby`** — installs `stubby` directly on
+  Debian/Ubuntu or RHEL/Fedora and points the whole host at it. Useful
+  when you want to test how a real endpoint (not a container) behaves
+  under a Gateway DoT policy, or when Docker isn't available.
+- **Native, systemd-resolved only (no `stubby`)** — if `stubby` genuinely
+  isn't an option (locked-down package policy, whatever), systemd v243+
+  has DoT support built in. No extra daemon, no port-53 fight — you're
+  reconfiguring the resolver that's already running instead of replacing
+  it. Slightly weaker enforcement guarantee than `stubby` (see the note
+  in that section), but workable.
 
 ## How this works
 
@@ -210,11 +216,87 @@ sudo systemctl enable --now stubby
 sudo systemctl restart stubby
 ```
 
-## 4. Verify it's working
+## 3d. Native install — systemd-resolved only (no `stubby`)
+
+If you can't install `stubby` at all, systemd-resolved (systemd v243+,
+default on most modern Ubuntu/Debian and Fedora Workstation installs)
+speaks DoT natively. You reconfigure the resolver that's already running
+instead of displacing it — which also means no port-53 conflict to fight
+and no need to touch `/etc/resolv.conf` (it's typically already a symlink
+to systemd-resolved's stub at `127.0.0.53`).
+
+Check you have a new enough systemd first:
+
+```
+systemctl --version   # want 243 or newer
+```
+
+**Bootstrap-resolve your DoT hostname** (replace with the hostname from
+step 1):
+
+```
+dig +short @8.8.8.8 A your-location-id.cloudflare-gateway.com
+```
+
+Note the IP it returns.
+
+**Create a drop-in config** pointing systemd-resolved at that IP, with
+the hostname pinned after `#` so it validates the upstream's TLS
+certificate against it — this is systemd-resolved's equivalent of
+`stubby`'s `tls_auth_name`:
+
+```
+sudo mkdir -p /etc/systemd/resolved.conf.d
+sudo tee /etc/systemd/resolved.conf.d/dot-gateway.conf > /dev/null <<'EOF'
+[Resolve]
+DNS=PASTE_BOOTSTRAP_IP_HERE#your-location-id.cloudflare-gateway.com
+DNSOverTLS=yes
+Domains=~.
+EOF
+```
+
+- `DNSOverTLS=yes` is the strict setting — it does not silently fall back
+  to plaintext DNS if TLS fails. (There's also `opportunistic`, which
+  does fall back — don't use that here, it defeats the point.)
+- `Domains=~.` makes this the default/preferred server for every domain,
+  not just a specific search domain — without it, systemd-resolved may
+  keep using other configured resolvers for some lookups.
+
+**Restart it:**
+
+```
+sudo systemctl restart systemd-resolved
+```
+
+**Verify** (this replaces step 4 below for this path — `/etc/resolv.conf`
+won't show `127.0.0.1` here, it'll still show the systemd-resolved stub):
+
+```
+resolvectl status                 # look for your IP under "Current DNS Server"
+                                   # and a "+DNSOverTLS" flag
+
+resolvectl query example.com      # resolves through the DoT path
+
+dig example.com                   # goes through the systemd-resolved stub,
+                                   # which forwards it over DoT
+```
+
+Then test a domain covered by the block policy from step 2 the same way
+— via `resolvectl query` or `dig`.
+
+> **Tradeoff vs. `stubby`:** `stubby` is configured with TLS as its
+> *only* transport — there is no non-TLS path for it to fall back to,
+> even accidentally. systemd-resolved's retry/fallback logic isn't quite
+> as rigorously all-or-nothing, so this path is a slightly weaker
+> enforcement guarantee. Fine for testing Gateway policy behavior; if
+> you need an airtight guarantee that zero plaintext DNS is possible,
+> prefer `stubby`.
+
+## 4. Verify it's working (Docker / native `stubby` paths)
 
 From a shell with `stubby` running and `/etc/resolv.conf` pointed at
 `127.0.0.1` (this is automatic in the Docker container; done manually in
-the native steps above):
+the native `stubby` steps above):
 
 ```
 cat /etc/resolv.conf              # should show only "nameserver 127.0.0.1"
@@ -250,6 +332,12 @@ hostname should resolve fine.
 - **Policy doesn't seem to be enforced** — confirm the DNS policy from
   step 2 is deployed and, if scoped with a `Location` selector, that it's
   scoped to the same DNS location whose DoT hostname you're using.
+- **(systemd-resolved path) `resolvectl status` doesn't show
+  `+DNSOverTLS`** — check `journalctl -u systemd-resolved` for TLS
+  handshake errors, confirm `DNSOverTLS=yes` (not `opportunistic`) is
+  actually in the drop-in that got applied
+  (`resolvectl status` prints which config file supplied each setting),
+  and re-check the bootstrap IP is still current.
 
 ## Notes / limitations
 

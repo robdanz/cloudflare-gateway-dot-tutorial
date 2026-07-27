@@ -1,0 +1,9 @@
+services:
+  dot-test:
+    build: .
+    environment:
+      DOT_HOSTNAME: ${DOT_HOSTNAME}
+      DOT_PORT: ${DOT_PORT:-853}
+      BOOTSTRAP_RESOLVER: ${BOOTSTRAP_RESOLVER:-8.8.8.8}
+    stdin_open: true
+    tty: true
